@@ -1,8 +1,11 @@
+{-# LANGUAGE DeriveFunctor #-}
+
 module Pattern where
 
 import qualified Data.Map.Strict as Map
 import           Data.Word (Word8)
-import Data.Maybe (catMaybes)
+import Data.Maybe (catMaybes, fromJust, isJust)
+import Control.Applicative ((<$>), pure)
 
 data Value = VS { svalue :: String   }
            | VF { fvalue :: Double   }
@@ -18,7 +21,7 @@ type Time = Rational
 -- A timespan has a beginning and end
 data Arc = Arc
   { start :: Time
-  , stop :: Time
+  , stop  :: Time
   } deriving (Eq, Ord, Show)
 
 -- | State is a dictionary of patterns
@@ -30,25 +33,34 @@ data Event a = Event
   { whole :: Maybe Arc
   , part :: Arc
   , value :: a
-  }
+  } deriving (Eq, Ord, Functor)
 
--- | A pattern is a function from timespans to events active in that
--- timespan. The world takes care of passing state between events.
+-- | A pattern is a function from a timespan, to the events active in
+-- that timespan.
 data Pattern a = Pattern {query :: Arc -> [Event a]}
 
--- eventFilters
+-- Instances
+
+instance Functor Pattern where
+  -- | apply a function to all the values in a pattern
+  fmap f p = p {query = fmap (fmap f) . query p}
+
+instance Applicative Pattern where
+  -- | Continuous event that lasts forever (as opposed to current
+  -- implementation where there is one event for cycle
+  pure v = Pattern $ \a -> [Event Nothing a v]
+  (<*>) = applyPatToPatBoth
+
+-- Event Filters
 
 -- | Remove events from patterns that do not meet the given test
 filterValues :: (a -> Bool) -> Pattern a -> Pattern a
 filterValues f p = p {query = filter (f . value) . query p}
 
-{-
--- | Turns a pattern of 'Maybe' values into a pattern of values,
--- dropping the events of 'Nothing'.
+-- | Turns a pattern of 'Maybe' values into a pattern of values
 filterJust :: Pattern (Maybe a) -> Pattern a
 filterJust p = fromJust <$> filterValues isJust p
 
--- formerly known as playWhen
 filterWhen :: (Time -> Bool) -> Pattern a -> Pattern a
 filterWhen test p = p {query = filter (test . wholeStart) . query p}
 
@@ -63,25 +75,23 @@ filterDigital = filterEvents isDigital
 
 filterAnalog :: Pattern a -> Pattern a
 filterAnalog = filterEvents isAnalog
--}
+
 -- Applicative
 
-{-
 applyPatToPatBoth :: Pattern (a -> b) -> Pattern a -> Pattern b
 applyPatToPatBoth pf px = Pattern q
     where q st = catMaybes $ (concatMap match $ query pf st) ++ (concatMap matchX $ query (filterAnalog px) st)
             where
               -- match analog events from pf with all events from px
-              match ef@(Event _ Nothing fPart _)   = map (withFX ef) (query px fPart) -- analog
+              match ef@(Event Nothing fPart _)   = map (withFX ef) (query px fPart) -- analog
               -- match digital events from pf with digital events from px
-              match ef@(Event _ (Just fWhole) _ _) = map (withFX ef) (query (filterDigital px) $ fWhole) -- digital
+              match ef@(Event (Just fWhole) _ _) = map (withFX ef) (query (filterDigital px) $ fWhole) -- digital
               -- match analog events from px (constrained above) with digital events from px
-              matchX ex@(Event _ Nothing fPart _)  = map (\ef -> withFX ef ex) (query (filterDigital pf) fPart) -- digital
+              matchX ex@(Event Nothing fPart _)  = map (\ef -> withFX ef ex) (query (filterDigital pf) fPart) -- digital
               matchX _ = error "can't happen"
               withFX ef ex = do whole' <- subMaybeArc (whole ef) (whole ex)
                                 part' <- subArc (part ef) (part ex)
-                                return (Event (combineContexts [context ef, context ex]) whole' part' (value ef $ value ex))
--}
+                                return (Event whole' part' (value ef $ value ex))
 
 -- Instances
 
@@ -169,3 +179,43 @@ mapCycle f (Arc s e) = Arc (sam' + f (s - sam')) (sam' + f (e - sam'))
 -- the arc represented by @a@.
 isIn :: Arc -> Time -> Bool
 isIn (Arc s e) t = t >= s && t < e
+
+
+wholeOrPart :: Event a -> Arc
+wholeOrPart (Event {whole = Just a}) = a
+wholeOrPart e = part e
+
+-- | Get the onset of an event's 'whole'
+wholeStart :: Event a -> Time
+wholeStart = start . wholeOrPart
+
+-- | Get the offset of an event's 'whole'
+wholeStop :: Event a -> Time
+wholeStop = stop . wholeOrPart
+
+-- | Get the onset of an event's 'whole'
+eventPartStart :: Event a -> Time
+eventPartStart = start . part
+
+-- | Get the offset of an event's 'part'
+eventPartStop :: Event a -> Time
+eventPartStop = stop . part
+
+-- | Get the timespan of an event's 'part'
+eventPart :: Event a -> Arc
+eventPart = part
+
+eventValue :: Event a -> a
+eventValue = value
+
+eventHasOnset :: Event a -> Bool
+eventHasOnset e | isAnalog e = False
+                | otherwise = start (fromJust $ whole e) == start (part e)
+
+isAnalog :: Event a -> Bool
+isAnalog (Event {whole = Nothing}) = True
+isAnalog _ = False
+
+isDigital :: Event a -> Bool
+isDigital = not . isAnalog
+
